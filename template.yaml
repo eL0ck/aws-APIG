@@ -1,38 +1,254 @@
 ---
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Basic API - Lambda and Dynamodb using SAM
-Globals:
-  Function:
-    Runtime: python3.6
-    Timeout: 5
-    MemorySize: 128
+Description: Test template for branch dev
+Parameters:
+    Stage:
+        Description: Namespaces the API (dev, uat, prod)
+        Type: String
+        Default: predev
     Environment:
-      Variables:
-        STACKNAME: !Ref "AWS::StackName"
+        Description: Using dev here.  Controls the access to the table
+        Type: String
+        Default: dev
+Globals:
+    Function:
+        Runtime: python3.7
+        Timeout: 60
+        MemorySize: 128
+        Environment:
+            Variables:
+                STACKNAME: !Ref "AWS::StackName"
 Resources:
-  ping:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: lambdas/
-      Handler: ping.main
-      AutoPublishAlias: dev
-      Events:
-        Endpoint:
-          Type: Api
-          Properties:
-            Path: /ping
-            Method: GET
-  Table:
-    Type: AWS::Serverless::SimpleTable
+    ApiGatewayApi:
+        Type: AWS::Serverless::Api
+        Properties:
+            StageName: !Ref Stage
+            DefinitionBody:
+                swagger: "2.0"
+                info:
+                    title: !Ref AWS::StackName
+                paths:
+                    /users/{userid}/predictedexpenses:
+                        get:
+                            consumes:
+                            - "application/json"
+                            produces:
+                            - "application/json"
+                            responses:
+                                "200":
+                                    description: "200 response"
+                                    headers:
+                                        Access-Control-Allow-Origin:
+                                            type: "string"
+                                        Content-Type:
+                                            type: "string"
+                                "500":
+                                    description: "500 response"
+                                    headers:
+                                        Access-Control-Allow-Origin:
+                                            type: "string"
+                                        Content-Type:
+                                            type: "string"
+                            x-amazon-apigateway-integration:
+                                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${predictedexpenses.Alias}/invocations
+                                responses:
+                                    "default":
+                                        statusCode: "200"
+                                        responseTemplates:
+                                            application/json: |
+                                                $input.path('$')
+                                    ".+":
+                                        statusCode: "500"
+                                        responseTemplates:
+                                            application/json: |
+                                                    #set($inputError = $util.parseJson($input.path('$.errorMessage')))
+                                                    #if($inputError.statusCode > 0)
+                                                    #set($context.responseOverride.status = $inputError.statusCode)
+                                                    {
+                                                            "error": "$inputError.error"
+                                                    }
+                                                    #else
+                                                    {
+                                                            "error": "$input.path('$.errorMessage')",
+                                                            "rawError": true
+                                                    }
+                                                    #end
+                                requestTemplates:
+                                        application/json: |
+                                                {
+                                                        "action": "getCashflowPrediction",
+                                                        "details": {
+                                                                #if($input.params('userid') != "")
+                                                                "userId": "$util.escapeJavaScript($input.params('userid')).replaceAll("\\'","'")"
+                                                                #end
+                                                        },
+                                                        "authorizer": {
+                                                                "userId": "$context.authorizer.userId",
+                                                                "userRole": "$context.authorizer.userRole",
+                                                                "token": "$context.authorizer.token"
+                                                        }
+                                                }
+                                passthroughBehavior: "never"
+                                httpMethod: "POST"
+                                contentHandling: "CONVERT_TO_TEXT"
+                                type: "aws"
+    ServerServiceRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                        Service:
+                          - lambda.amazonaws.com
+                    Action:
+                      - sts:AssumeRole
+            Path: /
+            Policies:
+              - PolicyName: root
+                PolicyDocument:
+                    Version: '2012-10-17'
+                    Statement:
+                      - Effect: Allow
+                        Action:
+                          - logs:CreateLogGroup
+                          - logs:CreateLogStream
+                          - logs:PutLogEvents
+                          - ec2:CreateNetworkInterface
+                          - ec2:DescribeNetworkInterfaces
+                          - ec2:DeleteNetworkInterface
+                          - xray:PutTraceSegments
+                          - xray:PutTelemetryRecords
+                        Resource: '*'
+                      - Effect: Allow
+                        Action:
+                          - dynamodb:*
+                        Resource: '*'
+                          #Fn::ImportValue: !Sub "prediction-table-${Environment}-arn"
+    PredictionInitiatorServiceRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                        AWS: arn:aws:iam::571865343317:user/tim.elson
+                        Service:
+                          - lambda.amazonaws.com
+                    Action:
+                      - sts:AssumeRole
+            Path: /
+            Policies:
+              - PolicyName: root
+                PolicyDocument:
+                    Version: '2012-10-17'
+                    Statement:
+                      - Effect: Allow
+                        Action:
+                          - logs:CreateLogGroup
+                          - logs:CreateLogStream
+                          - logs:PutLogEvents
+                          - ec2:CreateNetworkInterface
+                          - ec2:DescribeNetworkInterfaces
+                          - ec2:DeleteNetworkInterface
+                          - xray:PutTraceSegments
+                          - xray:PutTelemetryRecords
+                        Resource: '*'
+                      - Effect: Allow
+                        Action:
+                          - sqs:SendMessage
+                          - sqs:SendMessageBatch
+                        Resource: !GetAtt ModelingQueue.Arn
+                      - Effect: Allow
+                        Action:
+                          - lambda:InvokeFunction
+                        Resource: !GetAtt gluecaller.Arn
+                      - Effect: Allow
+                        Action:
+                          - execute-api:Invoke
+                        Resource: #'*'
+                          - Fn::Sub:
+                              - 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGateway}/*/GET/internal/users/*'
+                              - APIGateway:
+                                  Fn::ImportValue: !Sub 'apigateway-${Environment}'
+    GlueCallerServiceRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                        AWS: arn:aws:iam::571865343317:user/tim.elson
+                        Service:
+                          - lambda.amazonaws.com
+                    Action:
+                      - sts:AssumeRole
+            Path: /
+            Policies:
+              - PolicyName: root
+                PolicyDocument:
+                    Version: '2012-10-17'
+                    Statement:
+                      - Effect: Allow
+                        Action:
+                          - logs:CreateLogGroup
+                          - logs:CreateLogStream
+                          - logs:PutLogEvents
+                          - ec2:CreateNetworkInterface
+                          - ec2:DescribeNetworkInterfaces
+                          - ec2:DeleteNetworkInterface
+                          - xray:PutTraceSegments
+                          - xray:PutTelemetryRecords
+                        Resource: '*'
+                      - Effect: Allow
+                        Action:
+                          - glue:StartJobRun
+                        Resource: '*'
+                      - Effect: Allow
+                        Action:
+                          - sqs:ChangeMessageVisibility
+                          - sqs:DeleteMessage
+                          - sqs:GetQueueAttributes
+                          - sqs:ReceiveMessage
+                        Resource: !GetAtt ModelingQueue.Arn
+    predictedexpenses:
+        Type: AWS::Serverless::Function
+        Properties:
+            CodeUri: lambdas/
+            Handler: predictedexpenses.main
+            AutoPublishAlias: !Ref Stage
+            Role: !GetAtt ServerServiceRole.Arn
+            Timeout: 25
+            Environment:
+                Variables:
+                    PREDICTION_TABLE:
+                        Fn::ImportValue: !Sub "prediction-table-${Environment}"
+            Events:
+                Endpoint:
+                    Type: Api
+                    Properties:
+                        RestApiId: !Ref ApiGatewayApi
+                        Path: /users/{userid}/predictedexpenses  # Required even though duped in swagger
+                        Method: GET
 Outputs:
-  ApiURL:
-    Description: API endpoint URL
-    Export:
-      Name: !Sub "${AWS::StackName}-Endpoint"
-    Value: !Join
-      - '.'
-      - - !Sub "https://${ServerlessRestApi}"
-        - execute-api
-        - !Ref AWS::Region
-        - amazonaws.com/Prod
+    ApiURL:
+        Description: Glue caller proxy λ
+        Export:
+            Name: !Sub "${AWS::StackName}-gluecaller"
+        Value: !Ref gluecaller
+    ApiURL:
+        Description: API endpoint URL
+        Export:
+            Name: !Sub "${AWS::StackName}-Endpoint"
+        Value: !Join
+            - ''
+            - - https://
+                - !Ref ApiGatewayApi
+                - '.execute-api.'
+                - !Ref 'AWS::Region'
+                - '.amazonaws.com/'
+                - !Ref ApiGatewayApi.Stage
